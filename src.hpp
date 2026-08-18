@@ -47,8 +47,7 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
     gpu_sim.MoveMatrixToSharedMem(current_query);
 
     // Compute S = Q * K^T by splitting the inner dimension into 1-element
-    // outer products: S = sum_j (Q[:,j] * K^T[j,:]). This avoids the d^2 cost
-    // of a single large MatMul.
+    // outer products: S = sum_j (Q[:,j] * K^T[j,:]).
     const size_t d = current_query->GetColumnNum();
     Matrix *S_acc = nullptr;
     for (size_t j = 0; j < d; ++j) {
@@ -82,6 +81,7 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
     gpu_sim.ReleaseMatrix(S_acc);
 
     // Softmax each row of E and accumulate the weighted value sum.
+    // The answer is built directly in HBM to keep shared-memory peak low.
     Matrix *answer = nullptr;
     for (size_t r = 0; r <= i; ++r) {
       Matrix *e_r = matrix_memory_allocator.Allocate("e_" + std::to_string(r));
@@ -121,11 +121,12 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
       }
 
       Matrix *ans_r = ans_acc;
+      gpu_sim.MoveMatrixToGpuHbm(ans_r);
       if (r == 0) {
         answer = ans_r;
       } else {
         Matrix *answer_new = matrix_memory_allocator.Allocate("answer_new_" + std::to_string(r));
-        gpu_sim.Concat(answer, ans_r, answer_new, 0, kInSharedMemory);
+        gpu_sim.Concat(answer, ans_r, answer_new, 0, kInGpuHbm);
         gpu_sim.ReleaseMatrix(answer);
         gpu_sim.ReleaseMatrix(ans_r);
         answer = answer_new;
@@ -136,9 +137,6 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
       gpu_sim.ReleaseMatrix(p_r);
     }
     gpu_sim.ReleaseMatrix(E);
-
-    // Move final answer to HBM and commit
-    gpu_sim.MoveMatrixToGpuHbm(answer);
 
     gpu_sim.Run(false, &matrix_memory_allocator);
     rater.CommitAnswer(*answer);
