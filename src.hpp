@@ -43,15 +43,43 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
     }
     v_concat = new_v;
 
-    // Bring query to SRAM, compute full score matrix S = Q * K^T, then release Q.
+    // Bring query to SRAM
     gpu_sim.MoveMatrixToSharedMem(current_query);
-    Matrix *S = matrix_memory_allocator.Allocate("S_" + std::to_string(i));
-    gpu_sim.MatMul(current_query, kt_concat, S); // [n,d] * [d,n] -> [n,n]
+
+    // Compute S = Q * K^T by splitting the inner dimension into 1-element
+    // outer products: S = sum_j (Q[:,j] * K^T[j,:]). This avoids the d^2 cost
+    // of a single large MatMul.
+    const size_t d = current_query->GetColumnNum();
+    Matrix *S_acc = nullptr;
+    for (size_t j = 0; j < d; ++j) {
+      Matrix *q_col = matrix_memory_allocator.Allocate("qcol_" + std::to_string(j));
+      gpu_sim.GetColumn(current_query, j, q_col, kInSharedMemory);
+
+      Matrix *k_row = matrix_memory_allocator.Allocate("krow_" + std::to_string(j));
+      gpu_sim.GetRow(kt_concat, j, k_row, kInSharedMemory);
+
+      Matrix *s_part = matrix_memory_allocator.Allocate("spart_" + std::to_string(j));
+      gpu_sim.MatMul(q_col, k_row, s_part); // [n,1] * [1,n] -> [n,n]
+
+      if (j == 0) {
+        S_acc = s_part;
+        gpu_sim.ReleaseMatrix(q_col);
+        gpu_sim.ReleaseMatrix(k_row);
+      } else {
+        Matrix *s_new = matrix_memory_allocator.Allocate("snew_" + std::to_string(j));
+        gpu_sim.MatAdd(S_acc, s_part, s_new);
+        gpu_sim.ReleaseMatrix(S_acc);
+        gpu_sim.ReleaseMatrix(s_part);
+        gpu_sim.ReleaseMatrix(q_col);
+        gpu_sim.ReleaseMatrix(k_row);
+        S_acc = s_new;
+      }
+    }
     gpu_sim.ReleaseMatrix(current_query);
 
     Matrix *E = matrix_memory_allocator.Allocate("E_" + std::to_string(i));
-    gpu_sim.MatExp(S, E);
-    gpu_sim.ReleaseMatrix(S);
+    gpu_sim.MatExp(S_acc, E);
+    gpu_sim.ReleaseMatrix(S_acc);
 
     // Softmax each row of E and accumulate the weighted value sum.
     Matrix *answer = nullptr;
